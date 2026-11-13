@@ -6,55 +6,57 @@ from dotenv import load_dotenv
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# 1. Load environment variables (Загружаем переменные окружения)
+# 1. Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = os.getenv('ADMIN_ID')
 
 if not BOT_TOKEN or not ADMIN_ID:
-    print("🚨 Ошибка: Не найдены BOT_TOKEN или ADMIN_ID в файле .env")
+    print("🚨 Ошибка: Не найдены BOT_TOKEN или ADMIN_ID")
     exit(1)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# 2. Database setup (Настройка базы данных)
+# 2. Database setup
 conn = sqlite3.connect('bot_database.db', check_same_thread=False)
 cursor = conn.cursor()
+db_lock = threading.Lock() # 🚨 ДОБАВЛЕНА БЛОКИРОВКА ДЛЯ БАЗЫ
 
-# Create tables (Создаем таблицы)
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY,
-        username TEXT
-    )
-''')
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS ideas (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        content TEXT,
-        is_anonymous BOOLEAN,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-''')
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS tickets (
-        admin_message_id INTEGER PRIMARY KEY,
-        user_id INTEGER
-    )
-''')
-conn.commit()
+# Create tables
+with db_lock:
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ideas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            content TEXT,
+            is_anonymous BOOLEAN,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tickets (
+            admin_message_id INTEGER PRIMARY KEY,
+            user_id INTEGER
+        )
+    ''')
+    conn.commit()
 
-# 3. Handlers (Обработчики)
+# 3. Handlers
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
     username = message.from_user.username or "No_username"
     
-    # Save user to database
-    cursor.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (user_id, username))
-    conn.commit()
+    with db_lock: # 🚨 БЛОКИРОВКА
+        cursor.execute("INSERT OR IGNORE INTO users (id, username) VALUES (?, ?)", (user_id, username))
+        conn.commit()
 
     welcome_text = (
         f"Салют, {message.from_user.first_name}! 👋\n"
@@ -69,7 +71,6 @@ def handle_content(message):
         InlineKeyboardButton("🕵️ Анонимно", callback_data="anon_yes"),
         InlineKeyboardButton("👤 С моим ником", callback_data="anon_no")
     )
-    
     bot.reply_to(message, "как отправим?", reply_markup=markup)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('anon_'))
@@ -85,14 +86,13 @@ def handle_anonymity(call):
     content_type = message.content_type
     content_data = message.text if content_type == 'text' else message.caption or ""
     
-    # Save to DB
-    cursor.execute(
-        "INSERT INTO ideas (user_id, content, is_anonymous) VALUES (?, ?, ?)",
-        (user_id, content_data, is_anonymous)
-    )
-    conn.commit()
+    with db_lock: # 🚨 БЛОКИРОВКА
+        cursor.execute(
+            "INSERT INTO ideas (user_id, content, is_anonymous) VALUES (?, ?, ?)",
+            (user_id, content_data, is_anonymous)
+        )
+        conn.commit()
 
-    # Send to Admin
     if is_anonymous:
         admin_text = "🕵️ **Анонимная идея:**\n\n"
     else:
@@ -106,13 +106,13 @@ def handle_anonymity(call):
     else:
         sent_message = bot.copy_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id, caption=admin_text)
 
-    # Save ticket (Сохраняем связку админ-сообщение -> юзер)
     if sent_message:
-        cursor.execute(
-            "INSERT INTO tickets (admin_message_id, user_id) VALUES (?, ?)",
-            (sent_message.message_id, user_id)
-        )
-        conn.commit()
+        with db_lock: # 🚨 БЛОКИРОВКА
+            cursor.execute(
+                "INSERT INTO tickets (admin_message_id, user_id) VALUES (?, ?)",
+                (sent_message.message_id, user_id)
+            )
+            conn.commit()
 
     bot.edit_message_text(
         chat_id=call.message.chat.id, 
@@ -127,12 +127,13 @@ def reply_to_user(message):
 
     if message.reply_to_message:
         admin_msg_id = message.reply_to_message.message_id
-        cursor.execute("SELECT user_id FROM tickets WHERE admin_message_id = ?", (admin_msg_id,))
-        result = cursor.fetchone()
+        
+        with db_lock: # 🚨 БЛОКИРОВКА
+            cursor.execute("SELECT user_id FROM tickets WHERE admin_message_id = ?", (admin_msg_id,))
+            result = cursor.fetchone()
         
         if result:
             user_id = result[0]
-            # Отрезаем команду /reply
             reply_text = message.text.replace('/reply', '').strip()
             
             if reply_text:
@@ -148,13 +149,16 @@ def reply_to_user(message):
     else:
         bot.reply_to(message, "⚠️ Чтобы ответить, зажми сообщение и выбери 'Reply', затем напиши /reply Твой текст")
 
-
-# --- Заглушка для Render (чтобы Web Service не падал) ---
+# --- Заглушка для Render (с поддержкой HEAD запросов) ---
 class DummyServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot is alive!")
+
+    def do_HEAD(self): # 🚨 ДОБАВЛЕНО ДЛЯ RENDER
+        self.send_response(200)
+        self.end_headers()
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -164,6 +168,5 @@ def run_dummy_server():
 threading.Thread(target=run_dummy_server, daemon=True).start()
 # -------------------------------------------------------
 
-# 4. Start polling (Запускаем бота)
 print("Bot is running... (Бот запущен...)")
 bot.polling(none_stop=True)
